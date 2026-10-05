@@ -576,7 +576,8 @@ def api_mix_project(project_id: str):
         e = _entry(t.get("file_id"))
         if e:
             tracks.append({"path": _abs_path(e), "gain": t.get("gain", 1.0),
-                           "pan": t.get("pan", 0.0), "muted": t.get("muted", False)})
+                           "pan": t.get("pan", 0.0), "muted": t.get("muted", False),
+                           "automation": t.get("automation") or {}})
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     master = p.get("master", {})

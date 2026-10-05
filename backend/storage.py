@@ -28,6 +28,7 @@ on-disk artefacts cannot drift apart.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -48,6 +49,87 @@ def now_iso() -> str:
 
 def new_id() -> str:
     return uuid.uuid4().hex[:16]
+
+
+def _finite(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def _automation_nodes(value: Any, minimum: float, maximum: float) -> List[Dict[str, float]]:
+    """Normalise and de-duplicate one automation lane.
+
+    Multiple nodes on the same exact output frame are collapsed to the last one.
+    Sorting here keeps the mixer's interpolation cursor monotonic and also gives
+    persisted projects a canonical order.
+    """
+    if not isinstance(value, list):
+        return []
+    by_frame: Dict[int, float] = {}
+    for node in value:
+        if not isinstance(node, dict):
+            continue
+        try:
+            time = float(node.get("time"))
+            node_value = float(node.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(time) or not math.isfinite(node_value) or time < 0:
+            continue
+        frame = int(round(time * 192000.0))  # preserve sub-sample editing precision
+        by_frame[frame] = max(minimum, min(maximum, node_value))
+    return [{"time": frame / 192000.0, "value": value_}
+            for frame, value_ in sorted(by_frame.items())]
+
+
+def _normalize_track(track: Any, track_id: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(track, dict) or not track.get("file_id"):
+        return None
+    automation = track.get("automation") if isinstance(track.get("automation"), dict) else {}
+    # Accept the singular legacy name while new projects use ``automation``.
+    legacy_volume = track.get("envelope", {}).get("volume") if isinstance(track.get("envelope"), dict) else None
+    volume_nodes = _automation_nodes(automation.get("volume", legacy_volume), 0.0, 2.0)
+    pan_nodes = _automation_nodes(automation.get("pan"), -1.0, 1.0)
+    return {
+        "id": str(track.get("id") or track_id),
+        "file_id": str(track.get("file_id")),
+        "gain": _finite(track.get("gain"), 1.0, 0.0, 2.0),
+        "pan": _finite(track.get("pan"), 0.0, -1.0, 1.0),
+        "muted": bool(track.get("muted", False)),
+        "automation": {"volume": volume_nodes, "pan": pan_nodes},
+    }
+
+
+def normalize_project(data: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a safe project document containing only supported fields."""
+    data = data if isinstance(data, dict) else {}
+    existing = existing if isinstance(existing, dict) else {}
+    raw_tracks = data.get("tracks", existing.get("tracks", []))
+    tracks: List[Dict[str, Any]] = []
+    used_ids = set()
+    for track in raw_tracks if isinstance(raw_tracks, list) else []:
+        track_id = new_id()
+        normalized = _normalize_track(track, track_id)
+        if normalized is None:
+            continue
+        while normalized["id"] in used_ids:
+            normalized["id"] = new_id()
+        used_ids.add(normalized["id"])
+        tracks.append(normalized)
+
+    master_in = data.get("master", existing.get("master", {}))
+    master_in = master_in if isinstance(master_in, dict) else {}
+    master = {"gain": _finite(master_in.get("gain"), 1.0, 0.0, 2.0)}
+    return {
+        "name": str(data.get("name", existing.get("name", "Untitled")))[:120] or "Untitled",
+        "tracks": tracks,
+        "master": master,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -270,14 +352,13 @@ class Storage:
         return os.path.join(self.projects_dir, f"{project_id}.json")
 
     def create_project(self, name: str, tracks: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        normalized = normalize_project({"name": name, "tracks": tracks})
         project = {
             "id": new_id(),
-            "name": name,
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "version": 1,
-            "tracks": tracks or [],
-            "master": {"gain": 1.0},
+            **normalized,
         }
         with locked(self._project_path(project["id"]) + ".lock"):
             atomic_write(self._project_path(project["id"]), project)
@@ -303,7 +384,10 @@ class Storage:
             project = read_json(path, None)
             if project is None:
                 return None
-            project.update(patch)
+            safe_patch = normalize_project(patch, project)
+            project["name"] = safe_patch["name"]
+            project["tracks"] = safe_patch["tracks"]
+            project["master"] = safe_patch["master"]
             project["version"] = int(project.get("version", 0)) + 1
             project["updated_at"] = now_iso()
             atomic_write(path, project)
@@ -354,8 +438,9 @@ class Storage:
             current = read_json(path, None)
             if current is None:
                 return None
-            restored = dict(snap)
-            restored.pop("snapshot_at", None)
+            restored = normalize_project(snap)
+            restored["id"] = project_id
+            restored["created_at"] = snap.get("created_at", current.get("created_at", now_iso()))
             restored["version"] = int(current.get("version", 0)) + 1
             restored["updated_at"] = now_iso()
             restored["reverted_from"] = int(current.get("version", 0))

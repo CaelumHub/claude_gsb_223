@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>混音台</h1>
-    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · 主输出 · 项目配置存 JSON（每次修改自动版本化）</div>
+    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · 波形时间轴自动化包络 · 项目 JSON 自动保存与版本化</div>
   </div>
 </div>
 
@@ -33,7 +33,13 @@
       <h2 style="margin:0">主输出</h2>
       <label class="field inline">增益 <input type="range" id="masterGain" min="0" max="2" step="0.05" value="1"/><span id="masterVal" class="mono">1.00</span></label>
     </div>
-    <button class="btn-green" id="mixBtn" style="font-size:15px;padding:10px 20px">▶ 混音导出</button>
+    <div class="row">
+      <label class="field inline">时间轴缩放
+        <input type="range" id="timelineZoom" min="40" max="1200" step="20" value="260" style="width:180px"/>
+        <span id="zoomVal" class="mono small">260 px/s</span>
+      </label>
+      <button class="btn-green" id="mixBtn" style="font-size:15px;padding:10px 20px">▶ 混音导出</button>
+    </div>
   </div>
 </div>
 
@@ -45,13 +51,103 @@
 
 {% block scripts %}
 <script>
-let project = null, library = [], saving = false;
+let project = null, library = [];
+let timelinePps = 260;
+let saveChain = Promise.resolve();
+let saveTimer = null;
+const editors = new Map();
+const waveformCache = new Map();
+let projectToken = 0;
+
+const LANES = {
+  volume: { label: "音量", min: 0, max: 2, color: "#3fb950", empty: "空白：使用上方固定增益" },
+  pan: { label: "声像", min: -1, max: 1, color: "#bc8cff", empty: "空白：使用上方固定声像" },
+};
 
 async function loadLibrary() { library = await API.get("/api/library"); }
 
 function fileName(id) {
   const f = library.find(x => x.id === id);
   return f ? f.name : id;
+}
+
+function trackDuration(t) {
+  const f = library.find(x => x.id === t.file_id);
+  return Math.max(0.01, f?.duration || 0.01);
+}
+
+function makeTrackId() {
+  const bytes = new Uint8Array(12);
+  if (window.crypto?.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+  }
+  return "t" + Date.now().toString(36) + Math.random().toString(36).slice(2, 22);
+}
+
+function ensureProjectShape() {
+  if (!project) return;
+  project.master = project.master || {};
+  project.master.gain = +project.master.gain || 1;
+  for (const t of project.tracks || []) {
+    if (!t.id) t.id = makeTrackId();
+    t.gain = t.gain ?? 1;
+    t.pan = t.pan ?? 0;
+    t.muted = !!t.muted;
+    const oldEnv = t.envelope && typeof t.envelope === "object" ? t.envelope : {};
+    const auto = t.automation && typeof t.automation === "object" ? t.automation : {};
+    t.automation = {
+      volume: Array.isArray(auto.volume) ? auto.volume : (Array.isArray(oldEnv.volume) ? oldEnv.volume : []),
+      pan: Array.isArray(auto.pan) ? auto.pan : [],
+    };
+    for (const lane of Object.keys(LANES)) normalizeNodes(t, lane, false);
+  }
+}
+
+function normalizeNodes(track, lane, sortNow = true) {
+  const cfg = LANES[lane];
+  const byFrame = new Map();
+  for (const n of track.automation[lane]) {
+    const time = Number(n.time), value = Number(n.value);
+    if (!isFinite(time) || !isFinite(value) || time < 0) continue;
+    const frame = Math.round(time * 192000);
+    n.time = sortNow ? +Math.max(0, time).toFixed(6) : Math.max(0, time);
+    n.value = +Math.max(cfg.min, Math.min(cfg.max, value)).toFixed(4);
+    byFrame.set(frame, n); // a coincident node keeps the last edited value
+  }
+  const nodes = Array.from(byFrame.values());
+  if (sortNow) nodes.sort((a, b) => a.time - b.time);
+  track.automation[lane] = nodes;
+  return nodes;
+}
+
+function scheduleProjectSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { void saveProject(); }, 250);
+}
+
+function saveProject() {
+  clearTimeout(saveTimer);
+  if (!project) return Promise.resolve();
+  const projectId = project.id;
+  saveChain = saveChain.then(async () => {
+    ensureProjectShape();
+    const saved = await API.put(`/api/projects/${projectId}`, project);
+    if (!project || project.id !== projectId) return;
+    saved.tracks.forEach((st, i) => {
+      if (project.tracks[i]) {
+        project.tracks[i].id = st.id;
+        project.tracks[i].automation = st.automation;
+        const state = editors.get(project.tracks[i].id);
+        if (state) {
+          state.selected = null;
+          drawEditor(project.tracks[i]);
+        }
+      }
+    });
+    updateAllEditorStatus();
+  }).catch(e => toast(e.message, "error"));
+  return saveChain;
 }
 
 async function loadProjects(selected) {
@@ -70,43 +166,262 @@ async function loadProjects(selected) {
 }
 
 async function openProject(id) {
+  projectToken += 1;
+  const token = projectToken;
+  await saveProject();
   project = await API.get("/api/projects/" + id);
+  if (token !== projectToken) return;
+  ensureProjectShape();
   $("#projName").value = project.name;
   $("#masterGain").value = project.master?.gain ?? 1;
   $("#masterVal").textContent = (+$("#masterGain").value).toFixed(2);
+  editors.clear();
   renderTracks();
+  const needsIds = project.tracks.some(t => !t.id) ||
+    project.tracks.some(t => !t.automation);
+  if (needsIds) scheduleProjectSave();
 }
 
 function renderTracks() {
   const box = $("#tracks");
   if (!project || !project.tracks.length) {
+    editors.clear();
     box.innerHTML = `<div class="muted">项目还没有轨道 — 从上方添加。</div>`;
     return;
   }
-  box.innerHTML = project.tracks.map((t, i) => `
-    <div class="file-card row between mb">
-      <div style="min-width:220px" class="name">${esc(fileName(t.file_id))}</div>
-      <div class="row" style="flex:1">
-        <label class="field inline">增益
-          <input type="range" data-t="${i}" data-k="gain" min="0" max="2" step="0.02" value="${t.gain ?? 1}"/>
-          <span class="mono small">${(t.gain ?? 1).toFixed(2)}</span>
-        </label>
-        <label class="field inline">声像 L↔R
-          <input type="range" data-t="${i}" data-k="pan" min="-1" max="1" step="0.05" value="${t.pan ?? 0}"/>
-          <span class="mono small">${(t.pan ?? 0).toFixed(2)}</span>
-        </label>
-        <label class="field inline"><input type="checkbox" data-t="${i}" data-k="muted" ${t.muted ? "checked" : ""}/> 静音</label>
+
+  const oldEditors = new Map(editors);
+  editors.clear();
+  box.innerHTML = project.tracks.map((t, i) => {
+    const state = oldEditors.get(t.id) || { target: "volume", selected: null };
+    editors.set(t.id, state);
+    const vol = normalizeNodes(t, "volume", false).length;
+    const pan = normalizeNodes(t, "pan", false).length;
+    return `
+    <div class="file-card track-card mb" data-track-id="${esc(t.id)}">
+      <div class="row between track-head">
+        <div class="track-title">
+          <div class="name">${esc(fileName(t.file_id))}</div>
+          <div class="meta">${fmtTime(trackDuration(t))} · 音量节点 <b data-count="volume">${vol}</b> · 声像节点 <b data-count="pan">${pan}</b></div>
+        </div>
+        <div class="row track-controls">
+          <label class="field inline">增益
+            <input type="range" data-t="${i}" data-k="gain" min="0" max="2" step="0.02" value="${t.gain ?? 1}"/>
+            <span class="mono small">${(t.gain ?? 1).toFixed(2)}</span>
+          </label>
+          <label class="field inline">声像 L↔R
+            <input type="range" data-t="${i}" data-k="pan" min="-1" max="1" step="0.05" value="${t.pan ?? 0}"/>
+            <span class="mono small">${(t.pan ?? 0).toFixed(2)}</span>
+          </label>
+          <label class="field inline"><input type="checkbox" data-t="${i}" data-k="muted" ${t.muted ? "checked" : ""}/> 静音</label>
+          <button class="btn-sm btn-danger" data-del="${i}">✕</button>
+        </div>
       </div>
-      <button class="btn-sm btn-danger" data-del="${i}">✕</button>
-    </div>`).join("");
+      <div class="envelope-editor">
+        <div class="envelope-toolbar">
+          <div class="row">
+            <span class="envelope-title">自动化包络</span>
+            <button class="btn-sm lane-btn ${state.target === "volume" ? "active green" : ""}" data-lane="volume">音量</button>
+            <button class="btn-sm lane-btn ${state.target === "pan" ? "active purple" : ""}" data-lane="pan">声像</button>
+            <span class="badge neutral" data-role="lane-status"></span>
+            <button class="btn-sm" data-clear-envelope>清空当前包络</button>
+          </div>
+          <div class="small muted envelope-hint">空白处点击添加节点；拖动节点调整；Alt+点击或右键删除节点；横向滚动查看长音频。非空包络在导出时逐采样覆盖固定值。</div>
+        </div>
+        <div class="envelope-scroll" data-scroll>
+          <canvas class="envelope-canvas" data-t="${i}" tabindex="0"></canvas>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+
+  for (const t of project.tracks) {
+    void loadTrackWaveform(t);
+    drawEditor(t);
+    updateEditorStatus(t);
+  }
 }
 
-async function saveProject() {
-  if (!project || saving) return;
-  saving = true;
-  await API.put(`/api/projects/${project.id}`, project);
-  saving = false;
+function getTrackAndState(el) {
+  const card = el.closest(".track-card");
+  if (!card || !project) return null;
+  const id = card.dataset.trackId;
+  const track = project.tracks.find(t => t.id === id);
+  return track ? { track, state: editors.get(track.id) } : null;
 }
+
+function effectivePps(duration, viewWidth) {
+  return Math.min(timelinePps, Math.max(40, 20000 / Math.max(duration, 0.1)));
+}
+
+async function loadTrackWaveform(track) {
+  const state = editors.get(track.id);
+  if (!state) return;
+  const duration = trackDuration(track);
+  const canvas = getCanvas(track);
+  const viewWidth = canvas?.parentElement?.clientWidth || 700;
+  const pps = effectivePps(duration, viewWidth);
+  const points = Math.min(12000, Math.max(500, Math.ceil(duration * pps / 2)));
+  const key = `${track.file_id}:${points}`;
+  if (!state.waveforms) state.waveforms = new Map();
+  if (state.waveforms.has(key)) return;
+  if (!waveformCache.has(key)) {
+    waveformCache.set(key, API.get(`/api/audio/${track.file_id}/waveform?points=${points}`));
+  }
+  const requestToken = projectToken;
+  try {
+    const env = await waveformCache.get(key);
+    if (requestToken !== projectToken) return;
+    state.waveforms.set(key, env);
+    drawEditor(track);
+  } catch (e) {
+    waveformCache.delete(key);
+  }
+}
+
+function getCanvas(track) {
+  const card = $(`.track-card[data-track-id="${CSS.escape(track.id)}"]`);
+  return card?.querySelector(".envelope-canvas") || null;
+}
+
+function valueToY(value, lane, h) {
+  return h - 18 - ((value - lane.min) / (lane.max - lane.min)) * (h - 38);
+}
+function yToValue(y, lane, h) {
+  const v = lane.min + (1 - (y - 8) / (h - 26)) * (lane.max - lane.min);
+  return Math.max(lane.min, Math.min(lane.max, v));
+}
+
+function drawEditor(track) {
+  const canvas = getCanvas(track);
+  const state = editors.get(track.id);
+  if (!canvas || !state) return;
+  const laneName = state.target || "volume";
+  const lane = LANES[laneName];
+  const duration = trackDuration(track);
+  const viewWidth = canvas.parentElement.clientWidth || 700;
+  const pps = effectivePps(duration, viewWidth);
+  state.pps = pps;
+  const timelineWidth = Math.max(viewWidth, Math.ceil(duration * pps));
+  canvas.style.width = timelineWidth + "px";
+  canvas.style.height = "146px";
+
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--bg-inset").trim() || "#10141a";
+  ctx.fillRect(0, 0, w, h);
+
+  // Horizontal grid and scale labels.
+  const yVals = laneName === "volume" ? [0, 0.5, 1, 1.5, 2] : [-1, -0.5, 0, 0.5, 1];
+  ctx.font = "10px sans-serif";
+  ctx.textBaseline = "middle";
+  for (const v of yVals) {
+    const y = valueToY(v, lane, h);
+    ctx.strokeStyle = v === (laneName === "volume" ? 1 : 0) ? "rgba(139,148,158,0.35)" : "rgba(139,148,158,0.14)";
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.fillStyle = "rgba(139,148,158,0.85)";
+    const label = laneName === "volume" ? v.toFixed(1) + "x" : (v === 0 ? "中" : v < 0 ? `L ${Math.abs(v).toFixed(1)}` : `R ${v.toFixed(1)}`);
+    ctx.fillText(label, 6, y);
+  }
+
+  // Time ruler.
+  const intervals = [0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300];
+  const interval = intervals.find(v => v * pps >= 72) || 600;
+  ctx.strokeStyle = "rgba(139,148,158,0.18)";
+  ctx.fillStyle = "rgba(139,148,158,0.82)";
+  for (let t = 0; t <= duration + 0.0001; t += interval) {
+    const x = Math.round(t * pps) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 8); ctx.lineTo(x, h - 18); ctx.stroke();
+    ctx.fillText(fmtTime(t), x + 4, 12);
+  }
+
+  // Waveform behind the automation line.
+  const points = Math.min(12000, Math.max(500, Math.ceil(duration * pps / 2)));
+  const env = state.waveforms?.get(`${track.file_id}:${points}`);
+  const center = valueToY(laneName === "volume" ? 1 : 0, lane, h);
+  if (env?.mins?.length) {
+    const amp = h * 0.17;
+    ctx.strokeStyle = laneName === "volume" ? "rgba(88,166,255,0.38)" : "rgba(88,166,255,0.30)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < env.mins.length; i++) {
+      const x = (i / env.points) * env.duration * pps;
+      const yMin = center - (env.maxs[i] || 0) * amp;
+      const yMax = center - (env.mins[i] || 0) * amp;
+      ctx.moveTo(x, yMin); ctx.lineTo(x, yMax);
+    }
+    ctx.stroke();
+  }
+  ctx.strokeStyle = "rgba(139,148,158,0.35)";
+  ctx.beginPath(); ctx.moveTo(0, center); ctx.lineTo(w, center); ctx.stroke();
+
+  const nodes = normalizeNodes(track, laneName, true);
+  if (!nodes.length) {
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = "rgba(139,148,158,0.35)";
+    ctx.beginPath(); ctx.moveTo(0, center); ctx.lineTo(Math.min(w, duration * pps), center); ctx.stroke();
+    ctx.setLineDash([]);
+  } else {
+    ctx.strokeStyle = lane.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, valueToY(nodes[0].value, lane, h));
+    ctx.lineTo(nodes[0].time * pps, valueToY(nodes[0].value, lane, h));
+    for (let i = 1; i < nodes.length; i++) {
+      ctx.lineTo(nodes[i].time * pps, valueToY(nodes[i].value, lane, h));
+    }
+    const last = nodes[nodes.length - 1];
+    ctx.lineTo(Math.max(w, duration * pps), valueToY(last.value, lane, h));
+    ctx.stroke();
+
+    for (let i = 0; i < nodes.length; i++) {
+      const selected = state.selected === nodes[i];
+      const x = nodes[i].time * pps, y = valueToY(nodes[i].value, lane, h);
+      ctx.beginPath();
+      ctx.arc(x, y, selected ? 6.5 : 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = lane.color;
+      ctx.fill();
+      ctx.lineWidth = selected ? 2 : 1;
+      ctx.strokeStyle = "#fff";
+      ctx.stroke();
+    }
+  }
+}
+
+function findNodeAt(track, laneName, x, y, pps) {
+  const lane = LANES[laneName];
+  const canvas = getCanvas(track);
+  const h = canvas.clientHeight;
+  let best = null, bestDist = 9;
+  for (const n of track.automation[laneName]) {
+    const dx = Math.abs(n.time * pps - x);
+    const dy = Math.abs(valueToY(n.value, lane, h) - y);
+    const dist = Math.hypot(dx, dy);
+    if (dist < bestDist) { bestDist = dist; best = n; }
+  }
+  return best;
+}
+
+function pointerLocation(e, canvas) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function updateEditorStatus(track) {
+  const card = $(`.track-card[data-track-id="${CSS.escape(track.id)}"]`);
+  if (!card) return;
+  const state = editors.get(track.id);
+  const laneName = state?.target || "volume";
+  const lane = LANES[laneName];
+  const count = track.automation[laneName].length;
+  const status = card.querySelector('[data-role="lane-status"]');
+  if (status) status.textContent = count ? `${lane.label} · ${count} 节点` : lane.empty;
+  for (const [name, n] of [["volume", track.automation.volume.length], ["pan", track.automation.pan.length]]) {
+    const el = card.querySelector(`[data-count="${name}"]`);
+    if (el) el.textContent = n;
+  }
+}
+function updateAllEditorStatus() { if (project) project.tracks.forEach(updateEditorStatus); }
 
 $("#tracks").addEventListener("input", e => {
   const d = e.target.dataset;
@@ -114,22 +429,152 @@ $("#tracks").addEventListener("input", e => {
   const t = project.tracks[+d.t];
   const val = d.k === "muted" ? e.target.checked : +e.target.value;
   t[d.k] = val;
-  e.target.parentElement.querySelector("span") && (e.target.parentElement.querySelector("span").textContent = d.k === "muted" ? "" : val.toFixed(2));
-  saveProject();
+  const span = e.target.parentElement.querySelector("span");
+  if (span && d.k !== "muted") span.textContent = val.toFixed(2);
+  scheduleProjectSave();
 });
+
 $("#tracks").addEventListener("click", async e => {
-  if (e.target.dataset.del != null && project) {
+  if (!project) return;
+  if (e.target.dataset.del != null) {
     project.tracks.splice(+e.target.dataset.del, 1);
-    renderTracks(); saveProject();
+    renderTracks();
+    scheduleProjectSave();
+    return;
   }
+  const laneBtn = e.target.closest("[data-lane]");
+  if (laneBtn) {
+    const info = getTrackAndState(laneBtn);
+    if (!info) return;
+    info.state.target = laneBtn.dataset.lane;
+    info.state.selected = null;
+    renderTracks();
+    return;
+  }
+  if (e.target.hasAttribute("data-clear-envelope")) {
+    const info = getTrackAndState(e.target);
+    if (!info) return;
+    info.track.automation[info.state.target] = [];
+    info.state.selected = null;
+    drawEditor(info.track);
+    updateEditorStatus(info.track);
+    scheduleProjectSave();
+  }
+});
+
+$("#tracks").addEventListener("contextmenu", e => {
+  const canvas = e.target.closest(".envelope-canvas");
+  if (!canvas || !project) return;
+  e.preventDefault();
+  const info = getTrackAndState(canvas);
+  if (!info) return;
+  const { x, y } = pointerLocation(e, canvas);
+  const node = findNodeAt(info.track, info.state.target, x, y, info.state.pps);
+  if (node) {
+    info.track.automation[info.state.target] = info.track.automation[info.state.target].filter(n => n !== node);
+    info.state.selected = null;
+    drawEditor(info.track);
+    updateEditorStatus(info.track);
+    scheduleProjectSave();
+  }
+});
+
+$("#tracks").addEventListener("pointerdown", e => {
+  const canvas = e.target.closest(".envelope-canvas");
+  if (!canvas || !project || e.button === 2) return;
+  const info = getTrackAndState(canvas);
+  if (!info) return;
+  const { track, state } = info;
+  const laneName = state.target;
+  const { x, y } = pointerLocation(e, canvas);
+  const existing = findNodeAt(track, laneName, x, y, state.pps);
+  if (existing && e.altKey) {
+    track.automation[laneName] = track.automation[laneName].filter(n => n !== existing);
+    state.selected = null;
+    drawEditor(track);
+    updateEditorStatus(track);
+    scheduleProjectSave();
+    return;
+  }
+  const duration = trackDuration(track);
+  const node = existing || {
+    time: Math.max(0, Math.min(duration, x / state.pps)),
+    value: yToValue(y, LANES[laneName], canvas.clientHeight),
+  };
+  if (!existing) {
+    track.automation[laneName].push(node);
+    normalizeNodes(track, laneName, true);
+    const near = track.automation[laneName].find(n => Math.abs(n.time - node.time) < 1e-7 && n.value === node.value);
+    state.selected = near || node;
+  } else {
+    state.selected = existing;
+  }
+  state.drag = {
+    node: state.selected,
+    lane: laneName,
+    moved: false,
+    pointerId: e.pointerId,
+  };
+  canvas.setPointerCapture(e.pointerId);
+  drawEditor(track);
+  updateEditorStatus(track);
+});
+
+$("#tracks").addEventListener("pointermove", e => {
+  const canvas = e.target.closest(".envelope-canvas");
+  if (!canvas || !project) return;
+  const info = getTrackAndState(canvas);
+  if (!info) return;
+  const { track, state } = info;
+  const { x, y } = pointerLocation(e, canvas);
+  if (state.drag) {
+    const duration = trackDuration(track);
+    state.drag.node.time = Math.max(0, Math.min(duration, x / state.pps));
+    state.drag.node.value = yToValue(y, LANES[state.drag.lane], canvas.clientHeight);
+    state.drag.moved = true;
+    drawEditor(track);
+  }
+});
+
+$("#tracks").addEventListener("pointerup", e => {
+  const canvas = e.target.closest(".envelope-canvas");
+  if (!canvas || !project) return;
+  const info = getTrackAndState(canvas);
+  if (!info?.state.drag) return;
+  const { track, state } = info;
+  try { canvas.releasePointerCapture(state.drag.pointerId); } catch (_) { /* noop */ }
+  normalizeNodes(track, state.drag.lane, true);
+  state.selected = state.drag.node;
+  state.drag = null;
+  drawEditor(track);
+  updateEditorStatus(track);
+  scheduleProjectSave();
+});
+
+$("#tracks").addEventListener("pointercancel", e => {
+  const canvas = e.target.closest(".envelope-canvas");
+  const info = canvas ? getTrackAndState(canvas) : null;
+  if (info) info.state.drag = null;
+});
+
+$("#timelineZoom")?.addEventListener("input", e => {
+  timelinePps = +e.target.value;
+  $("#zoomVal").textContent = timelinePps + " px/s";
+  if (project) project.tracks.forEach(t => { void loadTrackWaveform(t); drawEditor(t); });
+});
+
+window.addEventListener("resize", () => {
+  if (project) project.tracks.forEach(drawEditor);
 });
 
 $("#addTrack").onclick = async () => {
   const fid = $("#fileSel").value;
   if (!project) return toast("请先新建或选择项目", "warn");
   if (!fid) return toast("请选择要添加的音频", "warn");
-  project.tracks.push({ file_id: fid, gain: 1, pan: 0, muted: false });
-  renderTracks(); saveProject();
+  project.tracks.push({ id: makeTrackId(), file_id: fid, gain: 1, pan: 0, muted: false,
+                        automation: { volume: [], pan: [] } });
+  renderTracks();
+  scheduleProjectSave();
   toast("已添加轨道", "success");
 };
 
@@ -142,13 +587,15 @@ $("#newProject").onclick = async () => {
 $("#projectSel").onchange = e => openProject(e.target.value);
 $("#masterGain").oninput = e => {
   $("#masterVal").textContent = (+e.target.value).toFixed(2);
-  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; saveProject(); }
+  if (project) { project.master = project.master || {}; project.master.gain = +e.target.value; scheduleProjectSave(); }
 };
 
 $("#mixBtn").onclick = async () => {
   if (!project || !project.tracks.length) return toast("请先添加轨道", "warn");
-  const btn = $("#mixBtn"); btn.disabled = true; btn.textContent = "混音中…";
+  const btn = $("#mixBtn");
+  btn.disabled = true; btn.textContent = "混音中…";
   try {
+    await saveProject();
     const entry = await API.post(`/api/projects/${project.id}/mix`, {});
     $("#resultCard").classList.remove("hidden");
     $("#resultRow").innerHTML = `
