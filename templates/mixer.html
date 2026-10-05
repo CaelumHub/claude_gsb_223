@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>混音台</h1>
-    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · 主输出 · 项目配置存 JSON（每次修改自动版本化）</div>
+    <div class="sub">多轨混音 · 增益 / 声像 / 静音 · <b>音量与声像自动化包络</b>（多节点、随时间变化）· 主输出 · 项目自动版本化</div>
   </div>
 </div>
 
@@ -35,6 +35,7 @@
     </div>
     <button class="btn-green" id="mixBtn" style="font-size:15px;padding:10px 20px">▶ 混音导出</button>
   </div>
+  <div class="mt small muted">导出严格按各轨道包络逐采样调节音量/声像；未启用包络的轨道使用固定增益与声像。</div>
 </div>
 
 <div class="card hidden" id="resultCard">
@@ -44,14 +45,29 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/envelope.js"></script>
 <script>
 let project = null, library = [], saving = false;
+const editors = new Map();   // track index -> EnvelopeEditor
 
 async function loadLibrary() { library = await API.get("/api/library"); }
 
 function fileName(id) {
   const f = library.find(x => x.id === id);
   return f ? f.name : id;
+}
+
+function fileEntry(id) { return library.find(x => x.id === id); }
+
+function envSummary(t) {
+  const e = t.envelopes || {};
+  const parts = [];
+  for (const mode of ["volume", "pan"]) {
+    const env = e[mode];
+    if (env && env.enabled && env.nodes && env.nodes.length)
+      parts.push(`${mode === "volume" ? "音量" : "声像"} ${env.nodes.length}节点`);
+  }
+  return parts.length ? parts.join(" · ") : "";
 }
 
 async function loadProjects(selected) {
@@ -71,6 +87,18 @@ async function loadProjects(selected) {
 
 async function openProject(id) {
   project = await API.get("/api/projects/" + id);
+  // Normalise persisted envelope structures once on load.
+  for (const t of project.tracks || []) {
+    t.envelopes = t.envelopes || {};
+    for (const mode of ["volume", "pan"]) {
+      const e = t.envelopes[mode] || {};
+      t.envelopes[mode] = {
+        enabled: !!e.enabled,
+        nodes: Array.isArray(e.nodes) ? e.nodes.map(n => ({ t: +n.t, v: +n.v }))
+                                     : [],
+      };
+    }
+  }
   $("#projName").value = project.name;
   $("#masterGain").value = project.master?.gain ?? 1;
   $("#masterVal").textContent = (+$("#masterGain").value).toFixed(2);
@@ -78,34 +106,91 @@ async function openProject(id) {
 }
 
 function renderTracks() {
+  // Editors keep their undo/DOM listeners keyed by track object; rebind them
+  // after the track list is rebuilt rather than destroying their state.
+  const oldEditors = new Map(editors);
+  editors.clear();
+
   const box = $("#tracks");
   if (!project || !project.tracks.length) {
+    for (const ed of oldEditors.values()) ed.destroy();
     box.innerHTML = `<div class="muted">项目还没有轨道 — 从上方添加。</div>`;
     return;
   }
-  box.innerHTML = project.tracks.map((t, i) => `
-    <div class="file-card row between mb">
-      <div style="min-width:220px" class="name">${esc(fileName(t.file_id))}</div>
-      <div class="row" style="flex:1">
-        <label class="field inline">增益
-          <input type="range" data-t="${i}" data-k="gain" min="0" max="2" step="0.02" value="${t.gain ?? 1}"/>
-          <span class="mono small">${(t.gain ?? 1).toFixed(2)}</span>
-        </label>
-        <label class="field inline">声像 L↔R
-          <input type="range" data-t="${i}" data-k="pan" min="-1" max="1" step="0.05" value="${t.pan ?? 0}"/>
-          <span class="mono small">${(t.pan ?? 0).toFixed(2)}</span>
-        </label>
-        <label class="field inline"><input type="checkbox" data-t="${i}" data-k="muted" ${t.muted ? "checked" : ""}/> 静音</label>
+  box.innerHTML = project.tracks.map((t, i) => {
+    const summary = envSummary(t);
+    return `
+    <div class="track-card mb" data-track="${i}">
+      <div class="row between">
+        <div style="min-width:220px" class="name">${esc(fileName(t.file_id))}</div>
+        <div class="row" style="flex:1">
+          <label class="field inline">增益
+            <input type="range" data-t="${i}" data-k="gain" min="0" max="2" step="0.02" value="${t.gain ?? 1}"/>
+            <span class="mono small">${(t.gain ?? 1).toFixed(2)}</span>
+          </label>
+          <label class="field inline">声像 L↔R
+            <input type="range" data-t="${i}" data-k="pan" min="-1" max="1" step="0.05" value="${t.pan ?? 0}"/>
+            <span class="mono small">${(t.pan ?? 0).toFixed(2)}</span>
+          </label>
+          <label class="field inline"><input type="checkbox" data-t="${i}" data-k="muted" ${t.muted ? "checked" : ""}/> 静音</label>
+        </div>
+        <div class="row">
+          <button class="btn-sm" data-env-toggle="${i}">〰 包络 ${summary ? `<span class="env-badge">${esc(summary)}</span>` : ""}</button>
+          <button class="btn-sm btn-danger" data-del="${i}">✕</button>
+        </div>
       </div>
-      <button class="btn-sm btn-danger" data-del="${i}">✕</button>
-    </div>`).join("");
+      <div class="env-panel hidden" data-env-panel="${i}"></div>
+    </div>`;
+  }).join("");
+
+  // Rebind surviving editors to their track objects and new mount points.
+  for (const ed of oldEditors.values()) {
+    const idx = project.tracks.indexOf(ed.track);
+    if (idx >= 0) {
+      const mount = $(`[data-env-panel="${idx}"]`);
+      mount.appendChild(ed.root);
+      mount.classList.remove("hidden");
+      $(`[data-env-toggle="${idx}"]`).classList.add("btn-primary");
+      editors.set(idx, ed);
+      ed.setTrack(ed.track);
+      ed.draw();
+    } else {
+      ed.destroy();
+    }
+  }
+}
+
+function ensureEditor(i) {
+  let ed = editors.get(i);
+  if (ed) return ed;
+  const t = project.tracks[i];
+  const entry = fileEntry(t.file_id);
+  const duration = entry ? (entry.duration || 0) : 0;
+  const mount = $(`[data-env-panel="${i}"]`);
+  ed = new EnvelopeEditor(t, entry, duration, persist => {
+    // Look the track up by object reference — indices may shift while open.
+    const idx = project.tracks.indexOf(t);
+    if (idx >= 0) updateEnvBadge(idx);
+    // Live drags only redraw; persist the project once per completed gesture.
+    if (persist) saveProject();
+  });
+  mount.appendChild(ed.root);
+  editors.set(i, ed);
+  return ed;
+}
+
+function updateEnvBadge(i) {
+  const btn = $(`[data-env-toggle="${i}"]`);
+  if (!btn || !project) return;
+  const summary = envSummary(project.tracks[i]);
+  btn.innerHTML = `〰 包络 ${summary ? `<span class="env-badge">${esc(summary)}</span>` : ""}`;
 }
 
 async function saveProject() {
   if (!project || saving) return;
   saving = true;
-  await API.put(`/api/projects/${project.id}`, project);
-  saving = false;
+  try { await API.put(`/api/projects/${project.id}`, project); }
+  finally { saving = false; }
 }
 
 $("#tracks").addEventListener("input", e => {
@@ -114,13 +199,32 @@ $("#tracks").addEventListener("input", e => {
   const t = project.tracks[+d.t];
   const val = d.k === "muted" ? e.target.checked : +e.target.value;
   t[d.k] = val;
-  e.target.parentElement.querySelector("span") && (e.target.parentElement.querySelector("span").textContent = d.k === "muted" ? "" : val.toFixed(2));
+  const span = e.target.parentElement.querySelector("span");
+  if (span) span.textContent = d.k === "muted" ? "" : val.toFixed(2);
+  // Fixed gain/pan change moves the dashed reference line in a live editor.
+  const ed = editors.get(+d.t);
+  if (ed && !ed.drag) ed.draw();
   saveProject();
 });
+
 $("#tracks").addEventListener("click", async e => {
-  if (e.target.dataset.del != null && project) {
-    project.tracks.splice(+e.target.dataset.del, 1);
+  const delBtn = e.target.closest("[data-del]");
+  if (delBtn && project) {
+    const i = +delBtn.dataset.del;
+    editors.get(i)?.destroy();
+    project.tracks.splice(i, 1);
     renderTracks(); saveProject();
+    return;
+  }
+  const togBtn = e.target.closest("[data-env-toggle]");
+  if (togBtn && project) {
+    const i = +togBtn.dataset.envToggle;
+    const panel = $(`[data-env-panel="${i}"]`);
+    const hidden = panel.classList.toggle("hidden");
+    togBtn.classList.toggle("btn-primary", !hidden);
+    if (!hidden) {
+      ensureEditor(i).draw();
+    }
   }
 });
 
@@ -128,7 +232,9 @@ $("#addTrack").onclick = async () => {
   const fid = $("#fileSel").value;
   if (!project) return toast("请先新建或选择项目", "warn");
   if (!fid) return toast("请选择要添加的音频", "warn");
-  project.tracks.push({ file_id: fid, gain: 1, pan: 0, muted: false });
+  project.tracks.push({ file_id: fid, gain: 1, pan: 0, muted: false, envelopes: {
+    volume: { enabled: false, nodes: [] }, pan: { enabled: false, nodes: [] },
+  } });
   renderTracks(); saveProject();
   toast("已添加轨道", "success");
 };
@@ -152,9 +258,9 @@ $("#mixBtn").onclick = async () => {
     const entry = await API.post(`/api/projects/${project.id}/mix`, {});
     $("#resultCard").classList.remove("hidden");
     $("#resultRow").innerHTML = `
-      <button class="btn-sm" onclick="playFile('${entry.id}','${esc(entry.name)}')">▶ 播放</button>
-      <a class="btn btn-sm" href="${API.downloadUrl(entry.id)}">下载</a>
-      <span class="muted">${esc(entry.name)} · ${fmtTime(entry.duration)}</span>`;
+      <button class="btn-sm" onclick="playFile('${entry.id}','${esc(entry.name)}')">▶ 播放</button>      <a class="btn btn-sm" href="${API.downloadUrl(entry.id)}">下载</a>
+      <span class="muted">${esc(entry.name)} · ${fmtTime(entry.duration)}
+        ${entry.automation ? `· 包络：音量×${entry.automation.volume_envelopes} 声像×${entry.automation.pan_envelopes}` : ""}</span>`;
     toast("混音完成", "success");
   } catch (e) { toast(e.message, "error"); }
   finally { btn.disabled = false; btn.textContent = "▶ 混音导出"; }

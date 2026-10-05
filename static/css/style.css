@@ -390,3 +390,55 @@ tr:hover td { background: var(--bg-raised); }
 
 details.help { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
 details.help summary { cursor: pointer; color: var(--accent); }
+
+/* ------------------------------------------------------- mixer: tracks */
+
+.track-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-raised);
+}
+.track-card .name { font-weight: 600; word-break: break-all; }
+
+.env-badge {
+  color: var(--accent);
+  font-weight: 600;
+  margin-left: 2px;
+}
+
+/* ------------------------------------------------- automation envelope */
+
+.env-panel {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+
+.env-editor { user-select: none; }
+.env-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.env-check { color: var(--text-muted); font-size: 12px; }
+.env-readout-wrap { margin-top: 6px; min-height: 16px; color: var(--text-muted); }
+
+.env-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+}
+.env-inner { min-width: 100%; }
+.env-inner canvas { display: block; }
+.env-inner canvas + canvas { border-top: 1px solid var(--border); }
+
+.env-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 7px; align-items: center; }
+.env-legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+
+/* segmented control */
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); overflow: hidden; }
+.seg button {
+  border: 0; border-radius: 0; background: var(--bg-inset);
+  padding: 5px 12px; font-size: 12px; color: var(--text-muted);
+}
+.seg button + button { border-left: 1px solid var(--border-strong); }
+.seg button.seg-on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }

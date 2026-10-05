@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, automation, chords, effects, mixer, realtime, separation, storage
 
 try:
     from flask_cors import CORS
@@ -575,8 +575,15 @@ def api_mix_project(project_id: str):
     for t in p.get("tracks", []):
         e = _entry(t.get("file_id"))
         if e:
+            # Normalise persisted envelopes so the mixer always receives
+            # sorted, clamped, in-range nodes.
+            vol_env = automation.normalize_envelope(
+                (t.get("envelopes") or {}).get("volume"), "volume")
+            pan_env = automation.normalize_envelope(
+                (t.get("envelopes") or {}).get("pan"), "pan")
             tracks.append({"path": _abs_path(e), "gain": t.get("gain", 1.0),
-                           "pan": t.get("pan", 0.0), "muted": t.get("muted", False)})
+                           "pan": t.get("pan", 0.0), "muted": t.get("muted", False),
+                           "volume_env": vol_env, "pan_env": pan_env})
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     master = p.get("master", {})
